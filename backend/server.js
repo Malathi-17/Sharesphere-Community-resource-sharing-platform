@@ -817,6 +817,14 @@ app.post("/booking", async (req, res) => {
     if (active[0].cnt >= comm[0].borrow_limit)
       return res.json({ message: `Borrow limit (${comm[0].borrow_limit}) reached for this community` });
 
+    // Prevent duplicate requests for the same resource by the same user
+    const duplicate = await query(
+      "SELECT booking_id FROM bookings WHERE resource_id=? AND borrower_id=? AND status IN ('REQUESTED','APPROVED','ACTIVE')",
+      [resource_id, borrower_id]
+    );
+    if (duplicate.length)
+      return res.status(409).json({ error: "You have already requested this item" });
+
     // Check date conflict
     const conflict = await query(
       `SELECT * FROM bookings WHERE resource_id=?
@@ -917,6 +925,40 @@ app.post("/booking/:id/approve", async (req, res) => {
     await query("UPDATE bookings SET status='ACTIVE' WHERE booking_id=?", [req.params.id]);
     await query("UPDATE resources SET available_quantity = available_quantity - 1 WHERE resource_id=?", [booking[0].resource_id]);
     await notify(booking[0].borrower_id, "Your booking was approved! Pick up the item.", "BOOKING");
+
+    // Send approval email to borrower
+    try {
+      const borrower = await query("SELECT name, email FROM users WHERE user_id=?", [booking[0].borrower_id]);
+      const resource = await query("SELECT name FROM resources WHERE resource_id=?", [booking[0].resource_id]);
+      if (borrower.length && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        const mailOptions = {
+          from: process.env.EMAIL_USER,
+          to: borrower[0].email,
+          subject: `ShareSphere - Your Borrow Request was Approved! ✅`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
+              <h2 style="color:#16a34a;">Request Approved! 🎉</h2>
+              <p>Hi <strong>${borrower[0].name}</strong>,</p>
+              <p>Great news! Your borrow request has been <strong>approved</strong>.</p>
+              <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+                <tr><td style="padding:8px;color:#6b7280;">Resource</td><td style="padding:8px;font-weight:600;">${resource[0]?.name || "N/A"}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280;">From Date</td><td style="padding:8px;font-weight:600;">${booking[0].start_date}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280;">To Date</td><td style="padding:8px;font-weight:600;">${booking[0].end_date}</td></tr>
+              </table>
+              <p>Please coordinate with the owner to pick up the item.</p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:20px;">— ShareSphere Platform</p>
+            </div>
+          `,
+        };
+        transporter.sendMail(mailOptions, (err) => {
+          if (err) console.error("Approval email failed:", err.message);
+          else console.log(`Approval email sent to ${borrower[0].email}`);
+        });
+      }
+    } catch (emailErr) {
+      console.error("Approval email error (non-blocking):", emailErr.message);
+    }
+
     res.json({ message: "Booking approved" });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -944,6 +986,41 @@ app.post("/booking/:id/reject", async (req, res) => {
 
     await query("UPDATE bookings SET status='REJECTED' WHERE booking_id=?", [req.params.id]);
     await notify(booking[0].borrower_id, `Your booking was rejected. ${reason || ""}`, "BOOKING");
+
+    // Send rejection email to borrower
+    try {
+      const borrower = await query("SELECT name, email FROM users WHERE user_id=?", [booking[0].borrower_id]);
+      const resource = await query("SELECT name FROM resources WHERE resource_id=?", [booking[0].resource_id]);
+      if (borrower.length && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        const mailOptions = {
+          from: process.env.EMAIL_USER,
+          to: borrower[0].email,
+          subject: `ShareSphere - Your Borrow Request was Rejected ❌`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
+              <h2 style="color:#dc2626;">Request Rejected</h2>
+              <p>Hi <strong>${borrower[0].name}</strong>,</p>
+              <p>Unfortunately, your borrow request has been <strong>rejected</strong>.</p>
+              <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+                <tr><td style="padding:8px;color:#6b7280;">Resource</td><td style="padding:8px;font-weight:600;">${resource[0]?.name || "N/A"}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280;">From Date</td><td style="padding:8px;font-weight:600;">${booking[0].start_date}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280;">To Date</td><td style="padding:8px;font-weight:600;">${booking[0].end_date}</td></tr>
+                ${reason ? `<tr><td style="padding:8px;color:#6b7280;">Reason</td><td style="padding:8px;font-weight:600;">${reason}</td></tr>` : ""}
+              </table>
+              <p>You may browse other available resources in your community.</p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:20px;">— ShareSphere Platform</p>
+            </div>
+          `,
+        };
+        transporter.sendMail(mailOptions, (err) => {
+          if (err) console.error("Rejection email failed:", err.message);
+          else console.log(`Rejection email sent to ${borrower[0].email}`);
+        });
+      }
+    } catch (emailErr) {
+      console.error("Rejection email error (non-blocking):", emailErr.message);
+    }
+
     res.json({ message: "Booking rejected" });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1487,6 +1564,37 @@ app.post("/request/:id/accept", async (req, res) => {
     const resourceInfo = await query("SELECT name FROM resources WHERE resource_id=?", [reqRow[0].resource_id]);
     await notify(reqRow[0].borrower_id, `✅ Your request to borrow "${resourceInfo[0]?.name}" has been accepted!`, "BOOKING");
 
+    // Send pickup OTP email to borrower
+    try {
+      const borrower = await query("SELECT name, email FROM users WHERE user_id=?", [reqRow[0].borrower_id]);
+      if (borrower.length && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        const mailOptions = {
+          from: process.env.EMAIL_USER,
+          to: borrower[0].email,
+          subject: `ShareSphere - Pickup OTP for "${resourceInfo[0]?.name}" 🔐`,
+          html: `
+            <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
+              <h2 style="color:#4f46e5;">Request Accepted! 🎉</h2>
+              <p>Hi <strong>${borrower[0].name}</strong>,</p>
+              <p>Your request to borrow <strong>${resourceInfo[0]?.name}</strong> has been accepted.</p>
+              <div style="background-color:#f3f4f6;padding:16px;border-radius:8px;text-align:center;margin:24px 0;">
+                <p style="margin:0;color:#4b5563;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Your Pickup OTP</p>
+                <p style="margin:8px 0 0 0;font-size:32px;font-weight:700;color:#111827;letter-spacing:4px;">${pickup_otp}</p>
+              </div>
+              <p style="color:#4b5563;font-size:14px;">Please share this OTP with the owner when you pick up the item.</p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:20px;">— ShareSphere Platform</p>
+            </div>
+          `,
+        };
+        transporter.sendMail(mailOptions, (err) => {
+          if (err) console.error("Pickup OTP email failed:", err.message);
+          else console.log(`Pickup OTP email sent to ${borrower[0].email}`);
+        });
+      }
+    } catch (emailErr) {
+      console.error("Pickup OTP email error (non-blocking):", emailErr.message);
+    }
+
     res.json({ message: "Request accepted and transaction created" });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1849,6 +1957,38 @@ app.post("/transaction/:id/status", async (req, res) => {
         await notify(tx[0].owner_id, `🔄 Borrower is ready to return "${itemName}".`, "BOOKING");
         await query("INSERT INTO borrow_chats (transaction_id, sender_id, message) VALUES (?,?,?)",
           [req.params.id, user_id, "🔄 I am ready to return the item."]);
+
+        // Send return OTP email to borrower
+        try {
+          const borrower = await query("SELECT name, email FROM users WHERE user_id=?", [tx[0].borrower_id]);
+          if (borrower.length && process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+            const mailOptions = {
+              from: process.env.EMAIL_USER,
+              to: borrower[0].email,
+              subject: `ShareSphere - Return OTP for "${itemName}" 🔄`,
+              html: `
+                <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px;">
+                  <h2 style="color:#4f46e5;">Ready to Return</h2>
+                  <p>Hi <strong>${borrower[0].name}</strong>,</p>
+                  <p>You have marked <strong>${itemName}</strong> as ready to return.</p>
+                  <div style="background-color:#f3f4f6;padding:16px;border-radius:8px;text-align:center;margin:24px 0;">
+                    <p style="margin:0;color:#4b5563;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Your Return OTP</p>
+                    <p style="margin:8px 0 0 0;font-size:32px;font-weight:700;color:#111827;letter-spacing:4px;">${return_otp}</p>
+                  </div>
+                  <p style="color:#4b5563;font-size:14px;">Please share this OTP with the owner when you hand over the item.</p>
+                  <p style="color:#9ca3af;font-size:12px;margin-top:20px;">— ShareSphere Platform</p>
+                </div>
+              `,
+            };
+            transporter.sendMail(mailOptions, (err) => {
+              if (err) console.error("Return OTP email failed:", err.message);
+              else console.log(`Return OTP email sent to ${borrower[0].email}`);
+            });
+          }
+        } catch (emailErr) {
+          console.error("Return OTP email error (non-blocking):", emailErr.message);
+        }
+
         return res.json({ message: "Return OTP generated" });
 
       case "verify_return":
